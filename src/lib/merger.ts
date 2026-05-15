@@ -1,161 +1,155 @@
-import { XMLParser, XMLBuilder } from "fast-xml-parser";
-import { readFileSync, mkdirSync, writeFileSync } from "fs";
-import type { XmlNode, PtfxItem, PtfxSection, MergeOptions, MergeStats } from "./types.ts";
+/**
+ * Real CodeWalker .ypt.xml format:
+ *
+ * <ParticleEffectsList>
+ *   <Name>asset_name</Name>
+ *   <EffectRuleDictionary>
+ *     <Item><Name>effect_name</Name>...</Item>
+ *   </EffectRuleDictionary>
+ *   <EmitterRuleDictionary>
+ *     <Item><Name>emitter_name</Name>...</Item>
+ *   </EmitterRuleDictionary>
+ *   <ParticleRuleDictionary>
+ *     <Item><Name>particle_name</Name>...</Item>
+ *   </ParticleRuleDictionary>
+ *   <DrawableDictionary>...</DrawableDictionary>
+ *   <TextureDictionary>...</TextureDictionary>
+ * </ParticleEffectsList>
+ *
+ * References inside items use TEXT CONTENT, not attributes:
+ *   <EmitterRule>emitter_name</EmitterRule>
+ *   <ParticleRule>particle_name</ParticleRule>
+ */
 
-const ATTR_PREFIX = "@_";
-const NAME_ATTR = `${ATTR_PREFIX}name`;
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { basename, dirname } from "path";
+import type { MergeOptions, MergeStats } from "./types.ts";
 
-const parserOptions = {
-  ignoreAttributes: false,
-  attributeNamePrefix: ATTR_PREFIX,
-  allowBooleanAttributes: true,
-  parseAttributeValue: false,  // keep all values as strings
-  preserveOrder: true,
-  commentPropName: "#comment",
-  trimValues: false,
-};
+// All dictionary section tags in a .ypt.xml file
+const DICT_TAGS = [
+  "EffectRuleDictionary",
+  "EmitterRuleDictionary",
+  "ParticleRuleDictionary",
+  "DrawableDictionary",
+  "TextureDictionary",
+] as const;
 
-const builderOptions = {
-  ignoreAttributes: false,
-  attributeNamePrefix: ATTR_PREFIX,
-  format: true,
-  indentBy: "    ",
-  preserveOrder: true,
-  commentPropName: "#comment",
-  suppressEmptyNode: false,
-};
+// Tags whose TEXT CONTENT references item names (need to be updated on rename)
+const REF_TAGS = ["EmitterRule", "ParticleRule", "EffectRule"];
 
-const parser = new XMLParser(parserOptions);
-const builder = new XMLBuilder(builderOptions);
+// ─── XML text utilities ───────────────────────────────────────────────────────
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-function getTag(node: XmlNode): string {
-  return Object.keys(node).find((k) => k !== ":@" && k !== "#comment") ?? "";
+/** Extract text content of first matching tag: <tag>content</tag> */
+function extractTag(xml: string, tag: string): string | null {
+  const re = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
+  const m = xml.match(re);
+  return m ? m[1] : null;
 }
 
-function getAttr(node: XmlNode, attr: string): string | undefined {
-  return node[":@"]?.[attr];
+/** Extract inner content of a section (everything inside <tag>...</tag>) */
+function extractSection(xml: string, tag: string): string {
+  const re = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`);
+  const m = xml.match(re);
+  return m ? m[1] : "";
 }
 
-function setAttr(node: XmlNode, attr: string, value: string): void {
-  if (!node[":@"]) node[":@"] = {};
-  node[":@"][attr] = value;
-}
-
-function getChildren(node: XmlNode): XmlNode[] {
-  const tag = getTag(node);
-  if (!tag) return [];
-  const val = node[tag];
-  if (!Array.isArray(val)) return [];
-  return val.filter((c): c is XmlNode => typeof c === "object" && c !== null);
-}
-
-// ─── rename logic ─────────────────────────────────────────────────────────────
-
-// Collect every name="..." of direct Item children inside a section
-function collectItemNames(sectionNode: XmlNode): Set<string> {
-  const names = new Set<string>();
-  for (const child of getChildren(sectionNode)) {
-    if (getTag(child) === "Item") {
-      const name = getAttr(child, NAME_ATTR);
-      if (name) names.add(name);
+/** Get all item names (first <Name> of each top-level <Item>) in a dictionary section */
+function extractItemNamesFromSection(sectionContent: string): string[] {
+  const names: string[] = [];
+  // Match each top-level <Item> block with proper depth tracking
+  const items = extractTopLevelItems(sectionContent);
+  for (const item of items) {
+    const name = extractTag(item, "Name");
+    if (name && name.trim() && !name.includes(":")) {
+      // Skip property names like "ptxCreationDomain:m_positionKFP"
+      names.push(name.trim());
     }
   }
   return names;
 }
 
-// Walk every attribute in a node tree; replace matching names with prefixed version
-function renameRefs(node: XmlNode, renameMap: Map<string, string>, depth = 0): void {
-  if (typeof node !== "object" || node === null || depth > 50) return;
-  if (node[":@"]) {
-    for (const [attr, val] of Object.entries(node[":@"])) {
-      if (typeof val === "string") {
-        const mapped = renameMap.get(val);
-        if (mapped) node[":@"][attr] = mapped;
+/** Extract top-level <Item>...</Item> blocks from a section (depth-aware) */
+function extractTopLevelItems(content: string): string[] {
+  const items: string[] = [];
+  let depth = 0;
+  let start = -1;
+  let i = 0;
+
+  while (i < content.length) {
+    if (content.startsWith("<Item>", i) || content.startsWith("<Item\n", i) || content.startsWith("<Item ", i)) {
+      if (depth === 0) start = i;
+      depth++;
+      i += 5;
+    } else if (content.startsWith("</Item>", i)) {
+      depth--;
+      i += 7;
+      if (depth === 0 && start !== -1) {
+        items.push(content.slice(start, i));
+        start = -1;
       }
+    } else {
+      i++;
     }
   }
-  for (const child of getChildren(node)) {
-    renameRefs(child, renameMap, depth + 1);
+
+  return items;
+}
+
+// ─── Rename logic ─────────────────────────────────────────────────────────────
+
+/** Apply prefix rename map to XML text — updates <Name> and all ref tags */
+function applyRenameMap(xml: string, renameMap: Map<string, string>): string {
+  if (renameMap.size === 0) return xml;
+
+  let result = xml;
+
+  for (const [original, renamed] of renameMap) {
+    // Escape for regex
+    const escaped = original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    // 1. Update <Name>original</Name>
+    result = result.replace(
+      new RegExp(`(<Name>\\s*)${escaped}(\\s*<\\/Name>)`, "g"),
+      `$1${renamed}$2`
+    );
+
+    // 2. Update reference tags: <EmitterRule>, <ParticleRule>, <EffectRule>
+    for (const refTag of REF_TAGS) {
+      result = result.replace(
+        new RegExp(`(<${refTag}>\\s*)${escaped}(\\s*<\\/${refTag}>)`, "g"),
+        `$1${renamed}$2`
+      );
+    }
   }
+
+  return result;
 }
 
-// Apply prefix to an item node and return the new name
-function prefixItem(itemNode: XmlNode, prefix: string, renameMap: Map<string, string>): string {
-  const original = getAttr(itemNode, NAME_ATTR) ?? "";
-  const newName = renameMap.get(original) ?? original;
-  setAttr(itemNode, NAME_ATTR, newName);
-  return newName;
-}
-
-// ─── parse one file ───────────────────────────────────────────────────────────
+// ─── Parse one file ───────────────────────────────────────────────────────────
 
 interface ParsedFile {
-  xmlDecl: XmlNode | null;      // <?xml ...?>
-  rootTag: string;              // ParticleEffectsList
-  sections: Map<string, PtfxSection>;
-  sectionOrder: string[];       // preserve section order from first file
   filename: string;
+  assetName: string;
+  xmlRaw: string; // original XML text
+  itemNames: Map<string, string[]>; // dictTag → item names
 }
 
 function parseFile(filepath: string): ParsedFile {
-  const raw = readFileSync(filepath, "utf-8");
-  const nodes: XmlNode[] = parser.parse(raw);
+  const xmlRaw = readFileSync(filepath, "utf-8");
+  const assetName = extractTag(xmlRaw, "Name")?.trim() ?? basename(filepath, ".ypt.xml");
 
-  let xmlDecl: XmlNode | null = null;
-  let rootNode: XmlNode | null = null;
-
-  for (const node of nodes) {
-    const tag = getTag(node);
-    if (tag === "?xml") { xmlDecl = node; continue; }
-    if (tag && tag !== "#comment") { rootNode = node; break; }
-  }
-
-  if (!rootNode) throw new Error(`No root element found in ${filepath}`);
-
-  const rootTag = getTag(rootNode);
-  const sections = new Map<string, PtfxSection>();
-  const sectionOrder: string[] = [];
-
-  for (const sectionNode of getChildren(rootNode)) {
-    const sTag = getTag(sectionNode);
-    if (!sTag || sTag === "#comment" || sTag === "#text") continue;
-
-    const items: PtfxItem[] = [];
-    const extra: XmlNode[] = [];
-
-    for (const child of getChildren(sectionNode)) {
-      if (getTag(child) === "Item" && getAttr(child, NAME_ATTR)) {
-        items.push({
-          name: getAttr(child, NAME_ATTR)!,
-          node: child,
-          sourceFile: filepath,
-        });
-      } else {
-        extra.push(child);
-      }
-    }
-
-    if (!sections.has(sTag)) {
-      sections.set(sTag, { tag: sTag, items: [], extra });
-      sectionOrder.push(sTag);
-    }
-
-    const existing = sections.get(sTag)!;
-    existing.items.push(...items);
-    // merge extras (deduplicate by string repr)
-    for (const e of extra) {
-      if (!existing.extra.some((x) => JSON.stringify(x) === JSON.stringify(e))) {
-        existing.extra.push(e);
-      }
+  const itemNames = new Map<string, string[]>();
+  for (const dictTag of DICT_TAGS) {
+    const section = extractSection(xmlRaw, dictTag);
+    if (section.trim()) {
+      itemNames.set(dictTag, extractItemNamesFromSection(section));
     }
   }
 
-  return { xmlDecl, rootTag, sections, sectionOrder, filename: filepath };
+  return { filename: filepath, assetName, xmlRaw, itemNames };
 }
 
-// ─── main merge ───────────────────────────────────────────────────────────────
+// ─── Main merge ───────────────────────────────────────────────────────────────
 
 export function merge(opts: MergeOptions): MergeStats {
   if (opts.inputs.length === 0) throw new Error("No input files provided");
@@ -168,7 +162,7 @@ export function merge(opts: MergeOptions): MergeStats {
     renamed: 0,
   };
 
-  // Parse all files
+  // ── Step 1: Parse all files
   const parsed = opts.inputs.map((f) => {
     if (opts.verbose) console.log(`  Parsing: ${f}`);
     const result = parseFile(f);
@@ -176,115 +170,144 @@ export function merge(opts: MergeOptions): MergeStats {
     return result;
   });
 
-  const firstFile = parsed[0];
+  // ── Step 2: Build rename maps per file (only rename items DEFINED in that file)
+  const renamedXmls: string[] = [];
+  const seenNames = new Map<string, string>(); // name → first file
 
-  // ── Step 1: build full rename map across ALL files BEFORE modifying nodes
-  //    so internal cross-references resolve correctly
-  const renameMap = new Map<string, string>(); // original → prefixed
+  for (const pf of parsed) {
+    // Build rename map for this file's item names only
+    const renameMap = new Map<string, string>();
 
-  if (!opts.noPrefix && opts.prefix) {
-    for (const pf of parsed) {
-      for (const section of pf.sections.values()) {
-        for (const item of section.items) {
-          if (!renameMap.has(item.name)) {
-            renameMap.set(item.name, opts.prefix + item.name);
-          }
-        }
-      }
-    }
-    stats.renamed = renameMap.size;
-  }
+    for (const [dictTag, names] of pf.itemNames) {
+      for (const name of names) {
+        stats.totalItems++;
 
-  // ── Step 2: detect conflicts (same name from different files, no prefix)
-  if (opts.noPrefix || !opts.prefix) {
-    const seen = new Map<string, string>(); // name → first filename
-    for (const pf of parsed) {
-      for (const section of pf.sections.values()) {
-        for (const item of section.items) {
-          if (seen.has(item.name)) {
-            const existing = stats.conflicts.find((c) => c.name === item.name);
+        // Conflict detection (before prefix)
+        if (!opts.noPrefix && !opts.prefix) {
+          if (seenNames.has(name)) {
+            const existing = stats.conflicts.find((c) => c.name === name);
             if (existing) {
-              if (!existing.files.includes(item.sourceFile)) existing.files.push(item.sourceFile);
+              if (!existing.files.includes(pf.filename)) existing.files.push(pf.filename);
             } else {
-              stats.conflicts.push({ name: item.name, files: [seen.get(item.name)!, item.sourceFile] });
+              stats.conflicts.push({ name, files: [seenNames.get(name)!, pf.filename] });
             }
           } else {
-            seen.set(item.name, item.sourceFile);
+            seenNames.set(name, pf.filename);
           }
         }
-      }
-    }
-  }
 
-  // ── Step 3: merge sections
-  const mergedSections = new Map<string, PtfxSection>();
-  const sectionOrder: string[] = firstFile.sectionOrder;
-
-  // ensure all section tags are in order (add new ones from other files at end)
-  for (const pf of parsed) {
-    for (const tag of pf.sectionOrder) {
-      if (!sectionOrder.includes(tag)) sectionOrder.push(tag);
-    }
-  }
-
-  for (const tag of sectionOrder) {
-    mergedSections.set(tag, { tag, items: [], extra: [] });
-  }
-
-  for (const pf of parsed) {
-    for (const [tag, section] of pf.sections) {
-      const merged = mergedSections.get(tag)!;
-
-      // Apply prefix and internal ref renames to each item
-      for (const item of section.items) {
-        if (renameMap.size > 0) {
-          prefixItem(item.node, opts.prefix, renameMap);
-          renameRefs(item.node, renameMap);
-          item.name = renameMap.get(item.name) ?? item.name;
-        }
-        merged.items.push(item);
-        stats.totalItems++;
-      }
-
-      // Merge extras
-      for (const e of section.extra) {
-        if (!merged.extra.some((x) => JSON.stringify(x) === JSON.stringify(e))) {
-          merged.extra.push(e);
+        if (opts.prefix && !opts.noPrefix) {
+          renameMap.set(name, opts.prefix + name);
+          stats.renamed++;
         }
       }
     }
+
+    // Apply rename to this file's XML
+    renamedXmls.push(applyRenameMap(pf.xmlRaw, renameMap));
   }
 
-  stats.sectionsFound = [...mergedSections.keys()];
+  // ── Step 3: Merge sections
+  const mergedSections = new Map<string, string>(); // dictTag → combined inner content
 
-  // ── Step 4: build output XML nodes
-  const rootChildren: XmlNode[] = [];
-
-  for (const tag of sectionOrder) {
-    const section = mergedSections.get(tag);
-    if (!section) continue;
-
-    const itemNodes: XmlNode[] = [
-      ...section.extra,
-      ...section.items.map((i) => i.node),
-    ];
-
-    const sectionNode: XmlNode = { [tag]: itemNodes };
-    rootChildren.push(sectionNode);
+  for (const dictTag of DICT_TAGS) {
+    const parts: string[] = [];
+    for (const xml of renamedXmls) {
+      const inner = extractSection(xml, dictTag).trim();
+      if (inner) parts.push(inner);
+    }
+    if (parts.length > 0) {
+      mergedSections.set(dictTag, parts.join("\n"));
+      if (!stats.sectionsFound.includes(dictTag)) stats.sectionsFound.push(dictTag);
+    }
   }
 
-  const rootNode: XmlNode = { [firstFile.rootTag]: rootChildren };
+  // ── Step 4: Build output XML
+  const outputAssetName = basename(opts.output, ".xml").replace(/\.ypt$/, "");
+  const lines: string[] = [];
 
-  const outputNodes: XmlNode[] = [];
-  if (firstFile.xmlDecl) outputNodes.push(firstFile.xmlDecl);
-  outputNodes.push(rootNode);
+  lines.push(`<?xml version="1.0" encoding="UTF-8"?>`);
+  lines.push(`<ParticleEffectsList>`);
+  lines.push(` <Name>${outputAssetName}</Name>`);
 
-  const xmlOut = builder.build(outputNodes) as string;
+  for (const dictTag of DICT_TAGS) {
+    const inner = mergedSections.get(dictTag);
+    lines.push(` <${dictTag}>`);
+    if (inner) lines.push(inner);
+    lines.push(` </${dictTag}>`);
+  }
 
-  // Write output
-  const outDir = opts.output.split(/[\\/]/).slice(0, -1).join("/");
-  if (outDir) mkdirSync(outDir, { recursive: true });
+  lines.push(`</ParticleEffectsList>`);
+
+  const xmlOut = lines.join("\n");
+
+  // ── Write output
+  const outDir = dirname(opts.output);
+  if (outDir && outDir !== ".") mkdirSync(outDir, { recursive: true });
   writeFileSync(opts.output, xmlOut, "utf-8");
 
   return stats;
+}
+
+/** Merge and return XML string directly (for web server, no file write) */
+export function mergeToString(opts: Omit<MergeOptions, "output"> & { outputName: string }): {
+  xml: string;
+  stats: MergeStats;
+} {
+  const stats: MergeStats = {
+    filesProcessed: 0,
+    sectionsFound: [],
+    totalItems: 0,
+    conflicts: [],
+    renamed: 0,
+  };
+
+  const parsed = opts.inputs.map((f) => {
+    const result = parseFile(f);
+    stats.filesProcessed++;
+    return result;
+  });
+
+  const renamedXmls: string[] = [];
+
+  for (const pf of parsed) {
+    const renameMap = new Map<string, string>();
+    for (const [, names] of pf.itemNames) {
+      for (const name of names) {
+        stats.totalItems++;
+        if (opts.prefix && !opts.noPrefix) {
+          renameMap.set(name, opts.prefix + name);
+          stats.renamed++;
+        }
+      }
+    }
+    renamedXmls.push(applyRenameMap(pf.xmlRaw, renameMap));
+  }
+
+  const mergedSections = new Map<string, string>();
+  for (const dictTag of DICT_TAGS) {
+    const parts: string[] = [];
+    for (const xml of renamedXmls) {
+      const inner = extractSection(xml, dictTag).trim();
+      if (inner) parts.push(inner);
+    }
+    if (parts.length > 0) {
+      mergedSections.set(dictTag, parts.join("\n"));
+      stats.sectionsFound.push(dictTag);
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push(`<?xml version="1.0" encoding="UTF-8"?>`);
+  lines.push(`<ParticleEffectsList>`);
+  lines.push(` <Name>${opts.outputName}</Name>`);
+  for (const dictTag of DICT_TAGS) {
+    const inner = mergedSections.get(dictTag);
+    lines.push(` <${dictTag}>`);
+    if (inner) lines.push(inner);
+    lines.push(` </${dictTag}>`);
+  }
+  lines.push(`</ParticleEffectsList>`);
+
+  return { xml: lines.join("\n"), stats };
 }

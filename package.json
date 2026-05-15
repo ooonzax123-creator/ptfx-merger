@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "merge": "bun src/merge.ts",
-    "dev": "bun --watch src/merge.ts"
+    "web": "bun src/server.ts",
+    "dev": "bun --watch src/server.ts"
   },
   "dependencies": {
     "fast-xml-parser": "^4.4.1"
