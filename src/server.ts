@@ -407,13 +407,26 @@ function setStatus(type, msg) {
     : msg;
 }
 
-// ── Syntax highlight (minimal)
+// ── Syntax highlight — single-pass so span tags don't corrupt each other
 function highlight(xml) {
-  return xml
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-    .replace(/(&lt;\\/?)([\\w\\-:]+)/g, '$1<span class="tag">$2</span>')
-    .replace(/ (\\w+)="([^"]*)"/g, ' <span class="attr">$1</span>="<span class="val">$2</span>"')
-    .replace(/(&lt;!--[\\s\\S]*?--&gt;)/g, '<span class="cmt">$1</span>');
+  // Use sentinel so we can escape < > safely then process in one regex pass
+  const s = xml
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '\x00L')
+    .replace(/>/g, '\x00G');
+
+  const out = s.replace(
+    /\x00L(\/?)(\w[\w\-:]*)((?:\s[\w\-:]+=(?:"[^"]*"|'[^']*'))*)\s*(\/?\x00G)/g,
+    (_, slash, tag, attrs, end) => {
+      const hAttrs = attrs.replace(
+        /\s([\w\-:]+)=("[^"]*"|'[^']*')/g,
+        ' <span class="attr">$1</span>=<span class="val">$2</span>'
+      );
+      return \`&lt;\${slash}<span class="tag">\${tag}</span>\${hAttrs}\${end.replace('\x00G', '>')}\`;
+    }
+  );
+
+  return out.replace(/\x00L/g, '&lt;').replace(/\x00G/g, '>');
 }
 
 // ── Merge
