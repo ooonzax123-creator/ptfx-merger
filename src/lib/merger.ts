@@ -95,6 +95,26 @@ function extractTopLevelItems(content: string): string[] {
   return items;
 }
 
+/** Deduplicate TextureDictionary items by <Name> — keep highest Width*Height on conflict */
+function deduplicateTextures(sectionContent: string): string {
+  const items = extractTopLevelItems(sectionContent);
+  const seen = new Map<string, { item: string; score: number }>();
+
+  for (const item of items) {
+    const name = extractTag(item, "Name")?.trim();
+    if (!name) continue;
+    const w = parseInt(extractTag(item, "Width") ?? "0");
+    const h = parseInt(extractTag(item, "Height") ?? "0");
+    const score = w * h;
+    const existing = seen.get(name);
+    if (!existing || score > existing.score) {
+      seen.set(name, { item, score });
+    }
+  }
+
+  return Array.from(seen.values()).map(v => v.item).join("\n");
+}
+
 // ─── Rename logic ─────────────────────────────────────────────────────────────
 
 /** Apply prefix rename map to XML text — updates <Name> and all ref tags */
@@ -196,8 +216,12 @@ export function merge(opts: MergeOptions): MergeStats {
           }
         }
 
-        if (opts.prefix && !opts.noPrefix) {
-          renameMap.set(name, opts.prefix + name);
+        const stripped = opts.stripPrefix && name.startsWith(opts.stripPrefix)
+          ? name.slice(opts.stripPrefix.length)
+          : name;
+        const newName = opts.prefix && !opts.noPrefix ? opts.prefix + stripped : stripped;
+        if (newName !== name) {
+          renameMap.set(name, newName);
           stats.renamed++;
         }
       }
@@ -217,7 +241,8 @@ export function merge(opts: MergeOptions): MergeStats {
       if (inner) parts.push(inner);
     }
     if (parts.length > 0) {
-      mergedSections.set(dictTag, parts.join("\n"));
+      const combined = parts.join("\n");
+      mergedSections.set(dictTag, dictTag === "TextureDictionary" ? deduplicateTextures(combined) : combined);
       if (!stats.sectionsFound.includes(dictTag)) stats.sectionsFound.push(dictTag);
     }
   }
@@ -275,8 +300,12 @@ export function mergeToString(opts: Omit<MergeOptions, "output"> & { outputName:
     for (const [, names] of pf.itemNames) {
       for (const name of names) {
         stats.totalItems++;
-        if (opts.prefix && !opts.noPrefix) {
-          renameMap.set(name, opts.prefix + name);
+        const stripped = opts.stripPrefix && name.startsWith(opts.stripPrefix)
+          ? name.slice(opts.stripPrefix.length)
+          : name;
+        const newName = opts.prefix && !opts.noPrefix ? opts.prefix + stripped : stripped;
+        if (newName !== name) {
+          renameMap.set(name, newName);
           stats.renamed++;
         }
       }
@@ -292,7 +321,8 @@ export function mergeToString(opts: Omit<MergeOptions, "output"> & { outputName:
       if (inner) parts.push(inner);
     }
     if (parts.length > 0) {
-      mergedSections.set(dictTag, parts.join("\n"));
+      const combined = parts.join("\n");
+      mergedSections.set(dictTag, dictTag === "TextureDictionary" ? deduplicateTextures(combined) : combined);
       stats.sectionsFound.push(dictTag);
     }
   }

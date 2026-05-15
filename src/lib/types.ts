@@ -4,6 +4,7 @@ export interface MergeOptions {
   inputs: string[];
   noPrefix: boolean;
   verbose: boolean;
+  stripPrefix?: string; // strip this prefix from item names before adding new prefix
 }
 
 export interface MergeStats {

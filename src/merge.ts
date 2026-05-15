@@ -16,11 +16,12 @@ import type { MergeOptions } from "./lib/types.ts";
 const { values, positionals } = parseArgs({
   args: process.argv.slice(2),
   options: {
-    prefix:    { type: "string",  short: "p", default: "" },
-    output:    { type: "string",  short: "o", default: "output/merged.ypt.xml" },
-    "no-prefix": { type: "boolean", default: false },
-    verbose:   { type: "boolean", short: "v", default: false },
-    help:      { type: "boolean", short: "h", default: false },
+    prefix:         { type: "string",  short: "p", default: "" },
+    output:         { type: "string",  short: "o", default: "output/merged.ypt.xml" },
+    "no-prefix":    { type: "boolean", default: false },
+    "strip-prefix": { type: "string",  default: "" },
+    verbose:        { type: "boolean", short: "v", default: false },
+    help:           { type: "boolean", short: "h", default: false },
   },
   allowPositionals: true,
 });
@@ -81,6 +82,7 @@ const opts: MergeOptions = {
   inputs,
   noPrefix,
   verbose: values.verbose as boolean,
+  stripPrefix: (values["strip-prefix"] as string) || undefined,
 };
 
 console.log(`\n🔧 ptfx-merger`);
