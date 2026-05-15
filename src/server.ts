@@ -476,10 +476,9 @@ function setStatus(type, msg) {
 function highlight(xml) {
   const LT = '@@LT@@', GT = '@@GT@@';
   const s = xml.replace(/&/g, '&amp;').replace(/</g, LT).replace(/>/g, GT);
-  const ltRe = LT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const gtRe = GT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // LT/GT use only @,L,T chars — safe to use directly in RegExp without escaping
   const tagRe = new RegExp(
-    ltRe + '(\\/?)([\\w][\\w\\-:]*)((?:\\s[\\w\\-:]+=(?:"[^"]*"|\'[^\']*\'))*)(\\s*\\/?' + gtRe + ')',
+    LT + '(\\/?)([\\w][\\w\\-:]*)((?:\\s[\\w\\-:]+=(?:"[^"]*"|\'[^\']*\'))*)(\\s*\\/?' + GT + ')',
     'g'
   );
   const out = s.replace(tagRe, (_, slash, tag, attrs, end) => {
@@ -489,7 +488,7 @@ function highlight(xml) {
     );
     return '&lt;' + slash + '<span class="tag">' + tag + '</span>' + hAttrs + end.replace(GT, '>');
   });
-  return out.replace(new RegExp(ltRe, 'g'), '&lt;').replace(new RegExp(gtRe, 'g'), '>');
+  return out.replace(new RegExp(LT, 'g'), '&lt;').replace(new RegExp(GT, 'g'), '>');
 }
 
 // ── Merge
