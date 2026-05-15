@@ -117,9 +117,12 @@ const HTML = /* html */ `<!DOCTYPE html>
     border-color: var(--accent);
     background: rgba(124, 92, 252, 0.06);
   }
-  .drop-zone input[type="file"] {
-    position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+  .pick-btn {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 0.35rem 0.8rem; font-size: 0.8rem; cursor: pointer;
+    transition: border-color 0.15s;
   }
+  .pick-btn:hover { border-color: var(--accent); color: var(--accent2); }
   .drop-zone .icon { font-size: 2rem; margin-bottom: 0.5rem; }
   .drop-zone p { color: var(--muted); font-size: 0.85rem; }
   .drop-zone strong { color: var(--text); }
@@ -290,10 +293,14 @@ const HTML = /* html */ `<!DOCTYPE html>
     <div>
       <label>เลือก .ypt.xml files</label>
       <div class="drop-zone" id="drop-zone">
-        <input type="file" id="file-input" accept=".xml" multiple />
         <div class="icon">📂</div>
-        <p><strong>Drag & drop</strong> .ypt.xml files ที่นี่</p>
-        <p>หรือคลิกเพื่อเลือกไฟล์</p>
+        <p><strong>Drag & drop</strong> ไฟล์หรือ folder ที่นี่</p>
+        <p style="margin-top:0.5rem;display:flex;gap:0.5rem;justify-content:center;flex-wrap:wrap">
+          <button class="pick-btn" id="pick-files">📄 เลือกไฟล์</button>
+          <button class="pick-btn" id="pick-folder">📁 เลือก Folder</button>
+        </p>
+        <input type="file" id="file-input" accept=".xml" multiple style="display:none" />
+        <input type="file" id="folder-input" accept=".xml" multiple style="display:none" webkitdirectory />
       </div>
     </div>
 
@@ -343,23 +350,34 @@ const HTML = /* html */ `<!DOCTYPE html>
 </main>
 
 <script>
-const fileInput = document.getElementById('file-input');
-const dropZone = document.getElementById('drop-zone');
-const fileList = document.getElementById('file-list');
-const fileCount = document.getElementById('file-count');
-const mergeBtn = document.getElementById('merge-btn');
-const status = document.getElementById('status');
-const xmlOutput = document.getElementById('xml-output');
+const fileInput   = document.getElementById('file-input');
+const folderInput = document.getElementById('folder-input');
+const dropZone    = document.getElementById('drop-zone');
+const fileList    = document.getElementById('file-list');
+const fileCount   = document.getElementById('file-count');
+const mergeBtn    = document.getElementById('merge-btn');
+const status      = document.getElementById('status');
+const xmlOutput   = document.getElementById('xml-output');
 const downloadBtn = document.getElementById('download-btn');
-const luaSnippet = document.getElementById('lua-snippet');
+const luaSnippet  = document.getElementById('lua-snippet');
 
-let files = [];
+let files = [];   // File[]
 let lastXml = '';
 
-// ── File handling
+// ── Helpers
+const isYpt = f => f.name.endsWith('.ypt.xml');
+const fileKey = f => f.name + '_' + f.size;
+
 function addFiles(newFiles) {
+  let added = 0;
   for (const f of newFiles) {
-    if (!files.find(x => x.name === f.name)) files.push(f);
+    if (!isYpt(f)) continue;
+    if (files.find(x => fileKey(x) === fileKey(f))) continue;
+    files.push(f);
+    added++;
+  }
+  if (added === 0 && newFiles.length > 0) {
+    setStatus('warn', \`⚠️ ไม่พบ .ypt.xml ในไฟล์ที่เลือก (\${newFiles.length} ไฟล์)\`);
   }
   renderFileList();
 }
@@ -370,15 +388,16 @@ function renderFileList() {
   for (let i = 0; i < files.length; i++) {
     const div = document.createElement('div');
     div.className = 'file-item';
+    const path = files[i].webkitRelativePath || files[i].name;
     div.innerHTML = \`
       <span>📄</span>
-      <span class="name" title="\${files[i].name}">\${files[i].name}</span>
+      <span class="name" title="\${path}">\${path}</span>
       <button class="remove" data-i="\${i}">×</button>
     \`;
     fileList.appendChild(div);
   }
   mergeBtn.disabled = files.length === 0;
-  if (files.length === 0) setStatus('idle', 'เลือกไฟล์อย่างน้อย 1 ไฟล์เพื่อเริ่ม');
+  if (files.length === 0) setStatus('idle', 'เลือกไฟล์หรือ folder อย่างน้อย 1 รายการ');
   else setStatus('idle', \`เลือก \${files.length} ไฟล์แล้ว — กด Merge เพื่อรวม\`);
 }
 
@@ -389,15 +408,61 @@ fileList.addEventListener('click', e => {
   renderFileList();
 });
 
-fileInput.addEventListener('change', e => addFiles(e.target.files));
+// ── Pickers
+document.getElementById('pick-files').addEventListener('click', e => {
+  e.stopPropagation();
+  fileInput.value = '';
+  fileInput.click();
+});
+document.getElementById('pick-folder').addEventListener('click', e => {
+  e.stopPropagation();
+  folderInput.value = '';
+  folderInput.click();
+});
+fileInput.addEventListener('change', e => addFiles(Array.from(e.target.files)));
+folderInput.addEventListener('change', e => addFiles(Array.from(e.target.files)));
 
+// ── Drag & drop — supports files AND folders (recursive)
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-dropZone.addEventListener('drop', e => {
+dropZone.addEventListener('drop', async e => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
-  addFiles(e.dataTransfer.files);
+
+  // Use DataTransferItem API for folder support
+  const items = Array.from(e.dataTransfer.items || []);
+  if (items.length && items[0].webkitGetAsEntry) {
+    setStatus('loading', 'กำลังสแกน folder...');
+    const collected = [];
+    await Promise.all(items.map(item => collectEntry(item.webkitGetAsEntry(), collected)));
+    addFiles(collected);
+  } else {
+    addFiles(Array.from(e.dataTransfer.files));
+  }
 });
+
+// Recursively walk a FileSystemEntry to collect File objects
+async function collectEntry(entry, out) {
+  if (!entry) return;
+  if (entry.isFile) {
+    if (entry.name.endsWith('.ypt.xml')) {
+      const f = await new Promise(res => entry.file(res));
+      out.push(f);
+    }
+  } else if (entry.isDirectory) {
+    const reader = entry.createReader();
+    await new Promise(res => {
+      function readBatch() {
+        reader.readEntries(async entries => {
+          if (!entries.length) { res(); return; }
+          await Promise.all(entries.map(e => collectEntry(e, out)));
+          readBatch();
+        });
+      }
+      readBatch();
+    });
+  }
+}
 
 // ── Status
 function setStatus(type, msg) {
@@ -407,26 +472,24 @@ function setStatus(type, msg) {
     : msg;
 }
 
-// ── Syntax highlight — single-pass so span tags don't corrupt each other
+// ── Syntax highlight — single pass, sentinel strings (no null bytes)
 function highlight(xml) {
-  // Use sentinel so we can escape < > safely then process in one regex pass
-  const s = xml
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '\x00L')
-    .replace(/>/g, '\x00G');
-
-  const out = s.replace(
-    /\x00L(\/?)(\w[\w\-:]*)((?:\s[\w\-:]+=(?:"[^"]*"|'[^']*'))*)\s*(\/?\x00G)/g,
-    (_, slash, tag, attrs, end) => {
-      const hAttrs = attrs.replace(
-        /\s([\w\-:]+)=("[^"]*"|'[^']*')/g,
-        ' <span class="attr">$1</span>=<span class="val">$2</span>'
-      );
-      return \`&lt;\${slash}<span class="tag">\${tag}</span>\${hAttrs}\${end.replace('\x00G', '>')}\`;
-    }
+  const LT = '@@LT@@', GT = '@@GT@@';
+  const s = xml.replace(/&/g, '&amp;').replace(/</g, LT).replace(/>/g, GT);
+  const ltRe = LT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const gtRe = GT.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const tagRe = new RegExp(
+    ltRe + '(\\/?)([\\w][\\w\\-:]*)((?:\\s[\\w\\-:]+=(?:"[^"]*"|\'[^\']*\'))*)(\\s*\\/?' + gtRe + ')',
+    'g'
   );
-
-  return out.replace(/\x00L/g, '&lt;').replace(/\x00G/g, '>');
+  const out = s.replace(tagRe, (_, slash, tag, attrs, end) => {
+    const hAttrs = attrs.replace(
+      /\s([\w\-:]+)=("[^"]*"|'[^']*')/g,
+      ' <span class="attr">$1</span>=<span class="val">$2</span>'
+    );
+    return '&lt;' + slash + '<span class="tag">' + tag + '</span>' + hAttrs + end.replace(GT, '>');
+  });
+  return out.replace(new RegExp(ltRe, 'g'), '&lt;').replace(new RegExp(gtRe, 'g'), '>');
 }
 
 // ── Merge
